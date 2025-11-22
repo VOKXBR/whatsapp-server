@@ -1,0 +1,189 @@
+import express from 'express';
+import makeWASocket from '@whiskeysockets/baileys';
+import { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import P from 'pino';
+import QRCode from 'qrcode';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+import fs from 'fs';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const app = express();
+app.use(express.json());
+
+const activeSessions = new Map();
+const AUTH_DIR = join(__dirname, 'sessions');
+
+if (!fs.existsSync(AUTH_DIR)) {
+  fs.mkdirSync(AUTH_DIR, { recursive: true });
+}
+
+// CORS
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+async function createConnection(userId, webhookUrl) {
+  const sessionDir = join(AUTH_DIR, userId);
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+  const { version } = await fetchLatestBaileysVersion();
+  
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: true,
+    logger: P({ level: 'silent' }),
+  });
+
+  let qrCode = null;
+  let isConnected = false;
+  let phoneNumber = null;
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log(`[${userId}] QR Code gerado`);
+      qrCode = await QRCode.toDataURL(qr);
+      
+      if (webhookUrl) {
+        fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId, event: 'qr_generated', qrCode })
+        }).catch(console.error);
+      }
+    }
+
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      
+      if (shouldReconnect) {
+        createConnection(userId, webhookUrl);
+      } else {
+        activeSessions.delete(userId);
+        isConnected = false;
+        
+        if (webhookUrl) {
+          fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId, event: 'disconnected' })
+          }).catch(console.error);
+        }
+      }
+    } else if (connection === 'open') {
+      console.log(`[${userId}] Conectado!`);
+      isConnected = true;
+      phoneNumber = sock.user?.id.split(':')[0] || null;
+      
+      if (webhookUrl) {
+        fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId, event: 'connected', phoneNumber })
+        }).catch(console.error);
+      }
+    }
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  activeSessions.set(userId, {
+    sock,
+    getQRCode: () => qrCode,
+    isConnected: () => isConnected,
+    getPhoneNumber: () => phoneNumber
+  });
+}
+
+// Gerar QR Code
+app.post('/generate-qr', async (req, res) => {
+  try {
+    const { userId, webhookUrl } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId obrigatório' });
+
+    if (activeSessions.has(userId)) {
+      const session = activeSessions.get(userId);
+      const qr = session.getQRCode();
+      return res.json({ success: true, qrCode: qr });
+    }
+
+    await createConnection(userId, webhookUrl);
+    
+    let attempts = 0;
+    while (attempts < 30) {
+      const session = activeSessions.get(userId);
+      const qr = session?.getQRCode();
+      if (qr) return res.json({ success: true, qrCode: qr });
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      attempts++;
+    }
+
+    res.status(408).json({ error: 'Timeout' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Status
+app.get('/status/:userId', (req, res) => {
+  const session = activeSessions.get(req.params.userId);
+  if (!session) return res.json({ isConnected: false });
+  res.json({ isConnected: session.isConnected(), phoneNumber: session.getPhoneNumber() });
+});
+
+// Enviar mensagem
+app.post('/send-message', async (req, res) => {
+  try {
+    const { userId, to, message } = req.body;
+    const session = activeSessions.get(userId);
+    
+    if (!session?.isConnected()) {
+      return res.status(400).json({ error: 'WhatsApp não conectado' });
+    }
+
+    const number = to.includes('@') ? to : `${to}@s.whatsapp.net`;
+    await session.sock.sendMessage(number, { text: message });
+    
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Desconectar
+app.post('/disconnect', async (req, res) => {
+  try {
+    const session = activeSessions.get(req.body.userId);
+    if (!session) return res.status(404).json({ error: 'Sessão não encontrada' });
+
+    await session.sock.logout();
+    activeSessions.delete(req.body.userId);
+    
+    const sessionDir = join(AUTH_DIR, req.body.userId);
+    if (fs.existsSync(sessionDir)) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Health
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', sessions: activeSessions.size });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
+});
